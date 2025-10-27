@@ -2,8 +2,8 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
 */
-import { GoogleGenAI } from "@google/genai";
-import type { GenerateContentResponse } from "@google/genai";
+import { GoogleGenAI, Modality } from "@google/genai";
+import type { GenerateContentResponse, VideosOperation } from "@google/genai";
 
 const API_KEY = process.env.API_KEY;
 
@@ -28,32 +28,16 @@ const DECADE_STYLES: Record<string, string> = {
 
 
 // --- Helper Functions ---
-
-/**
- * Creates a fallback prompt to use when the primary one is blocked.
- * @param decade The decade string (e.g., "1950s").
- * @returns The fallback prompt string.
- */
 function getFallbackPrompt(decade: string): string {
     const styleHint = DECADE_STYLES[decade] || "capture the distinct fashion, hairstyles, and overall atmosphere of that time period.";
     return `Create an authentic-looking photograph of the person in this image from the ${decade}. The clothing, hairstyle, and photo quality must match the era. Specific photo style to emulate: ${styleHint}. The output must only be the image.`;
 }
 
-/**
- * Extracts the decade (e.g., "1950s") from a prompt string.
- * @param prompt The original prompt.
- * @returns The decade string or null if not found.
- */
 function extractDecade(prompt: string): string | null {
     const match = prompt.match(/(\d{4}s)/);
     return match ? match[1] : null;
 }
 
-/**
- * Processes the Gemini API response, extracting the image or throwing an error if none is found.
- * @param response The response from the generateContent call.
- * @returns A data URL string for the generated image.
- */
 function processGeminiResponse(response: GenerateContentResponse): string {
     const imagePartFromResponse = response.candidates?.[0]?.content?.parts?.find(part => part.inlineData);
 
@@ -67,12 +51,6 @@ function processGeminiResponse(response: GenerateContentResponse): string {
     throw new Error(`The AI model responded with text instead of an image: "${textResponse || 'No text response received.'}"`);
 }
 
-/**
- * A wrapper for the Gemini API call that includes a retry mechanism for internal server errors.
- * @param imagePart The image part of the request payload.
- * @param textPart The text part of the request payload.
- * @returns The GenerateContentResponse from the API.
- */
 async function callGeminiWithRetry(imagePart: object, textPart: object): Promise<GenerateContentResponse> {
     const maxRetries = 3;
     const initialDelay = 1000;
@@ -80,7 +58,7 @@ async function callGeminiWithRetry(imagePart: object, textPart: object): Promise
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
             return await ai.models.generateContent({
-                model: 'gemini-2.5-flash-image-preview',
+                model: 'gemini-2.5-flash-image',
                 contents: { parts: [imagePart, textPart] },
             });
         } catch (error) {
@@ -94,21 +72,13 @@ async function callGeminiWithRetry(imagePart: object, textPart: object): Promise
                 await new Promise(resolve => setTimeout(resolve, delay));
                 continue;
             }
-            throw error; // Re-throw if not a retriable error or if max retries are reached.
+            throw error;
         }
     }
-    // This should be unreachable due to the loop and throw logic above.
     throw new Error("Gemini API call failed after all retries.");
 }
 
 
-/**
- * Generates a decade-styled image from a source image and a prompt.
- * It includes a fallback mechanism for prompts that might be blocked in certain regions.
- * @param imageDataUrl A data URL string of the source image (e.g., 'data:image/png;base64,...').
- * @param prompt The prompt to guide the image generation.
- * @returns A promise that resolves to a base64-encoded image data URL of the generated image.
- */
 export async function generateDecadeImage(imageDataUrl: string, prompt: string): Promise<string> {
   const match = imageDataUrl.match(/^data:(image\/\w+);base64,(.*)$/);
   if (!match) {
@@ -120,7 +90,6 @@ export async function generateDecadeImage(imageDataUrl: string, prompt: string):
         inlineData: { mimeType, data: base64Data },
     };
 
-    // --- First attempt with the original prompt ---
     try {
         console.log("Attempting generation with original prompt...");
         const textPart = { text: prompt };
@@ -135,10 +104,9 @@ export async function generateDecadeImage(imageDataUrl: string, prompt: string):
             const decade = extractDecade(prompt);
             if (!decade) {
                 console.error("Could not extract decade from prompt, cannot use fallback.");
-                throw error; // Re-throw the original "no image" error.
+                throw error;
             }
 
-            // --- Second attempt with the fallback prompt ---
             try {
                 const fallbackPrompt = getFallbackPrompt(decade);
                 console.log(`Attempting generation with fallback prompt for ${decade}...`);
@@ -151,9 +119,129 @@ export async function generateDecadeImage(imageDataUrl: string, prompt: string):
                 throw new Error(`The AI model failed with both original and fallback prompts. Last error: ${finalErrorMessage}`);
             }
         } else {
-            // This is for other errors, like a final internal server error after retries.
             console.error("An unrecoverable error occurred during image generation.", error);
             throw new Error(`The AI model failed to generate an image. Details: ${errorMessage}`);
         }
+    }
+}
+
+export async function editDecadeImage(imageDataUrl: string, prompt: string): Promise<string> {
+    const match = imageDataUrl.match(/^data:(image\/\w+);base64,(.*)$/);
+    if (!match) {
+        throw new Error("Invalid image data URL format. Expected 'data:image/...;base64,...'");
+    }
+    const [, mimeType, base64Data] = match;
+
+    const imagePart = {
+        inlineData: { mimeType, data: base64Data },
+    };
+    const textPart = { text: prompt };
+
+    try {
+        console.log("Attempting image edit...");
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-image',
+            contents: {
+                parts: [imagePart, textPart],
+            },
+            config: {
+                responseModalities: [Modality.IMAGE],
+            },
+        });
+        return processGeminiResponse(response);
+    } catch (error) {
+        console.error("An error occurred during image editing.", error);
+        const errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+        throw new Error(`The AI model failed to edit the image. Details: ${errorMessage}`);
+    }
+}
+
+
+/**
+ * Generates a short, thematic audio description for a given decade.
+ * @param decade The decade string (e.g., "1970s").
+ * @returns A promise that resolves to a base64-encoded audio data string.
+ */
+export async function generateAudioDescription(decade: string): Promise<string> {
+    // 1. Generate a creative script
+    const textGenResponse = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: `Create a short, fun, immersive audio script (30-50 words) for a person looking at their photo from the ${decade}. It could be a snippet from a radio broadcast, a diary entry, or a comment from a friend. Make it sound authentic to the era. The output should be only the script text itself.`,
+    });
+    const script = textGenResponse.text;
+
+    // 2. Generate audio from the script
+    const ttsResponse = await ai.models.generateContent({
+        model: "gemini-2.5-flash-preview-tts",
+        contents: [{ parts: [{ text: script }] }],
+        config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+                voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: 'Kore' },
+                },
+            },
+        },
+    });
+
+    const audioData = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!audioData) {
+        throw new Error("TTS model did not return audio data.");
+    }
+    return audioData;
+}
+
+
+/**
+ * Generates a short video based on a starting image and a decade.
+ * @param imageDataUrl The data URL of the seed image.
+ * @param decade The decade string (e.g., "1950s").
+ * @param aspectRatio The desired aspect ratio for the video.
+ * @returns A promise that resolves to an object URL for the generated video.
+ */
+export async function generateDecadeVideo(imageDataUrl: string, decade: string, aspectRatio: '9:16' | '16:9'): Promise<string> {
+    const match = imageDataUrl.match(/^data:(image\/\w+);base64,(.*)$/);
+    if (!match) {
+        throw new Error("Invalid image data URL format for video generation.");
+    }
+    const [, mimeType, imageBytes] = match;
+
+    const videoAi = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+    try {
+        let operation: VideosOperation = await videoAi.models.generateVideos({
+            model: 'veo-3.1-fast-generate-preview',
+            prompt: `A short, vintage-style video clip of this person from the ${decade}. The person should be subtly animated, perhaps smiling, looking around, or with a slight breeze in their hair. The video should have the look and feel of an authentic home movie from that era.`,
+            image: { imageBytes, mimeType },
+            config: {
+                numberOfVideos: 1,
+                resolution: '720p',
+                aspectRatio: aspectRatio
+            }
+        });
+
+        // Poll for completion
+        while (!operation.done) {
+            await new Promise(resolve => setTimeout(resolve, 10000));
+            operation = await videoAi.operations.getVideosOperation({ operation: operation });
+        }
+
+        const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
+        if (!downloadLink) {
+            throw new Error("Video generation completed, but no download link was found.");
+        }
+        
+        // Fetch the video data using the API key
+        const response = await fetch(`${downloadLink}&key=${process.env.API_KEY}`);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch video data: ${response.statusText}`);
+        }
+        const videoBlob = await response.blob();
+        return URL.createObjectURL(videoBlob);
+
+    } catch (error) {
+        console.error("Video generation process failed:", error);
+        // Re-throw a more user-friendly error
+        throw new Error(`Video generation failed. Details: ${error instanceof Error ? error.message : String(error)}`);
     }
 }

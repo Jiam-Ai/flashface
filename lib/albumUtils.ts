@@ -6,7 +6,6 @@
 function loadImage(src: string): Promise<HTMLImageElement> {
     return new Promise((resolve, reject) => {
         const img = new Image();
-        // Setting crossOrigin is good practice for canvas operations, even with data URLs
         img.crossOrigin = 'anonymous';
         img.onload = () => resolve(img);
         img.onerror = (err) => reject(new Error(`Failed to load image: ${src.substring(0, 50)}...`));
@@ -21,7 +20,6 @@ function loadImage(src: string): Promise<HTMLImageElement> {
  */
 export async function createAlbumPage(imageData: Record<string, string>): Promise<string> {
     const canvas = document.createElement('canvas');
-    // High-resolution canvas for good quality (A4-like ratio)
     const canvasWidth = 2480;
     const canvasHeight = 3508;
     canvas.width = canvasWidth;
@@ -32,22 +30,17 @@ export async function createAlbumPage(imageData: Record<string, string>): Promis
         throw new Error('Could not get 2D canvas context');
     }
 
-    // 1. Draw the album page background
-    ctx.fillStyle = '#fdf5e6'; // A warm, parchment-like color
+    ctx.fillStyle = '#fdf5e6';
     ctx.fillRect(0, 0, canvasWidth, canvasHeight);
 
-    // 2. Draw the title
     ctx.fillStyle = '#333';
     ctx.textAlign = 'center';
-
     ctx.font = `bold 100px 'Caveat', cursive`;
     ctx.fillText('Generated with Past Forward', canvasWidth / 2, 150);
-
     ctx.font = `50px 'Roboto', sans-serif`;
     ctx.fillStyle = '#555';
     ctx.fillText('on Google AI Studio', canvasWidth / 2, 220);
 
-    // 3. Load all the polaroid images concurrently
     const decades = Object.keys(imageData);
     const loadedImages = await Promise.all(
         Object.values(imageData).map(url => loadImage(url))
@@ -58,15 +51,21 @@ export async function createAlbumPage(imageData: Record<string, string>): Promis
         img: loadedImages[index],
     }));
 
-    // 4. Define grid layout and draw each polaroid
-    const grid = { cols: 2, rows: 3, padding: 100 };
-    const contentTopMargin = 300; // Space for the header
+    // Dynamically determine grid layout based on image count
+    const imageCount = imagesWithDecades.length;
+    let cols = 3; // Default
+    if (imageCount <= 2) cols = 2;
+    if (imageCount === 4) cols = 2;
+    if (imageCount > 9) cols = 4;
+    const rows = Math.ceil(imageCount / cols);
+
+    const grid = { cols, rows, padding: 100 };
+    const contentTopMargin = 300;
     const contentHeight = canvasHeight - contentTopMargin;
     const cellWidth = (canvasWidth - grid.padding * (grid.cols + 1)) / grid.cols;
     const cellHeight = (contentHeight - grid.padding * (grid.rows + 1)) / grid.rows;
 
-    // Calculate polaroid dimensions to fit inside the grid cell with a margin
-    const polaroidAspectRatio = 1.2; // height is 1.2 times width
+    const polaroidAspectRatio = 1.2;
     const maxPolaroidWidth = cellWidth * 0.9;
     const maxPolaroidHeight = cellHeight * 0.9;
 
@@ -79,44 +78,31 @@ export async function createAlbumPage(imageData: Record<string, string>): Promis
     }
 
     const imageContainerWidth = polaroidWidth * 0.9;
-    const imageContainerHeight = imageContainerWidth; // Classic square-ish photo area
+    const imageContainerHeight = imageContainerWidth;
 
-    // Reverse the drawing order: draw bottom rows first so top rows are rendered on top
-    const reversedImages = [...imagesWithDecades].reverse();
-    reversedImages.forEach(({ decade, img }, reversedIndex) => {
-        // Calculate the original index to determine grid position
-        const index = imagesWithDecades.length - 1 - reversedIndex;
-
+    imagesWithDecades.forEach(({ decade, img }, index) => {
         const row = Math.floor(index / grid.cols);
         const col = index % grid.cols;
 
-        // Calculate top-left corner of the polaroid within its grid cell
         const x = grid.padding * (col + 1) + cellWidth * col + (cellWidth - polaroidWidth) / 2;
         const y = contentTopMargin + grid.padding * (row + 1) + cellHeight * row + (cellHeight - polaroidHeight) / 2;
         
         ctx.save();
-        
-        // Translate context to the center of the polaroid for rotation
         ctx.translate(x + polaroidWidth / 2, y + polaroidHeight / 2);
         
-        // Apply a slight, random rotation for a hand-placed look
-        const rotation = (Math.random() - 0.5) * 0.1; // Radians (approx. +/- 2.8 degrees)
+        const rotation = (Math.random() - 0.5) * 0.1;
         ctx.rotate(rotation);
         
-        // Draw a soft shadow
         ctx.shadowColor = 'rgba(0, 0, 0, 0.3)';
         ctx.shadowBlur = 35;
         ctx.shadowOffsetX = 5;
         ctx.shadowOffsetY = 10;
         
-        // Draw the white polaroid frame (centered at the new origin)
         ctx.fillStyle = '#fff';
         ctx.fillRect(-polaroidWidth / 2, -polaroidHeight / 2, polaroidWidth, polaroidHeight);
         
-        // Remove shadow for subsequent drawing
         ctx.shadowColor = 'transparent';
         
-        // Calculate image dimensions to fit while maintaining aspect ratio
         const aspectRatio = img.naturalWidth / img.naturalHeight;
         let drawWidth = imageContainerWidth;
         let drawHeight = drawWidth / aspectRatio;
@@ -126,16 +112,13 @@ export async function createAlbumPage(imageData: Record<string, string>): Promis
             drawWidth = drawHeight * aspectRatio;
         }
 
-        // Calculate position to center the image within its container area
         const imageAreaTopMargin = (polaroidWidth - imageContainerWidth) / 2;
         const imageContainerY = -polaroidHeight / 2 + imageAreaTopMargin;
-        
-        const imgX = -drawWidth / 2; // Horizontally centered due to context translation
+        const imgX = -drawWidth / 2;
         const imgY = imageContainerY + (imageContainerHeight - drawHeight) / 2;
         
         ctx.drawImage(img, imgX, imgY, drawWidth, drawHeight);
         
-        // Draw the handwritten caption
         ctx.fillStyle = '#222';
         ctx.font = `60px 'Permanent Marker', cursive`;
         ctx.textAlign = 'center';
@@ -146,10 +129,8 @@ export async function createAlbumPage(imageData: Record<string, string>): Promis
         const captionY = captionAreaTop + (captionAreaBottom - captionAreaTop) / 2;
 
         ctx.fillText(decade, 0, captionY);
-        
-        ctx.restore(); // Restore context to pre-transformation state
+        ctx.restore();
     });
 
-    // Convert canvas to a high-quality JPEG and return the data URL
     return canvas.toDataURL('image/jpeg', 0.9);
 }

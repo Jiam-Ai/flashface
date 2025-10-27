@@ -5,8 +5,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { DraggableCardContainer, DraggableCardBody, DraggableCardRef } from './ui/draggable-card';
 import { cn } from '../lib/utils';
-// FIX: The `PanInfo` type is reported as not being exported. Remove it and use `any` for the info object to resolve the error.
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
 
 type ImageStatus = 'pending' | 'done' | 'error';
 
@@ -20,9 +19,47 @@ interface PolaroidCardProps {
     onShake?: (caption: string) => void;
     onDownload?: (caption: string) => void;
     onShare?: (caption: string) => void;
+    onAnimate?: (caption: string) => void;
+    onEdit?: (caption: string) => void;
+    onPlayAudio?: (caption: string) => void;
+    onViewVideo?: (caption: string) => void;
+    videoUrl?: string;
+    isAnimating?: boolean;
+    isAudioLoading?: boolean;
     isMobile?: boolean;
     progress?: number;
 }
+
+
+// FIX: Refactored ActionButton to be a typed React.FC to resolve incorrect "missing children" errors.
+interface ActionButtonProps {
+    onClick: (e: React.MouseEvent) => void;
+    'aria-label': string;
+    isLoading?: boolean;
+    children: React.ReactNode;
+}
+
+const ActionButton: React.FC<ActionButtonProps> = ({ onClick, 'aria-label': ariaLabel, children, isLoading }) => {
+    return (
+        <button
+            onClick={(e) => {
+                e.stopPropagation();
+                onClick(e);
+            }}
+            className="p-2 bg-black/50 rounded-full text-white hover:bg-black/75 focus:outline-none focus:ring-2 focus:ring-white disabled:opacity-50 disabled:cursor-not-allowed"
+            aria-label={ariaLabel}
+            disabled={isLoading}
+        >
+            {isLoading ? (
+                <svg className="h-5 w-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+            ) : children}
+        </button>
+    );
+};
+
 
 const DevelopingIndicator = ({ progress }: { progress?: number }) => (
     <div className="flex flex-col items-center justify-center h-full w-full relative overflow-hidden text-neutral-500">
@@ -37,9 +74,7 @@ const DevelopingIndicator = ({ progress }: { progress?: number }) => (
         <p className="font-permanent-marker text-base sm:text-lg text-neutral-500 animate-breathe z-10">
             {`Developing... ${Math.round(progress ?? 0)}%`}
         </p>
-        {/* Progress Bar */}
         <div className="absolute bottom-4 left-4 right-4 h-1 bg-neutral-800/50 rounded-full overflow-hidden">
-            {/* @ts-ignore */}
             <motion.div
                 className="h-full bg-neutral-400"
                 initial={{ width: '0%' }}
@@ -86,23 +121,24 @@ const Placeholder = () => (
 );
 
 
-const PolaroidCard: React.FC<PolaroidCardProps> = ({ imageUrl, caption, description, status, error, dragConstraintsRef, onShake, onDownload, onShare, isMobile, progress }) => {
+const PolaroidCard: React.FC<PolaroidCardProps> = (props) => {
+    const { imageUrl, caption, description, status, error, dragConstraintsRef, onShake, onDownload, onShare, onAnimate, onEdit, onPlayAudio, onViewVideo, videoUrl, isAnimating, isAudioLoading, isMobile, progress } = props;
     const [isDeveloped, setIsDeveloped] = useState(false);
     const [isImageLoaded, setIsImageLoaded] = useState(false);
     const [isShareSupported, setIsShareSupported] = useState(false);
     const [isShaking, setIsShaking] = useState(false);
+    const [isHovered, setIsHovered] = useState(false);
+    const [isDownloading, setIsDownloading] = useState(false);
     const cardBodyRef = useRef<DraggableCardRef>(null);
     const lastShakeTime = useRef(0);
     const lastVelocity = useRef({ x: 0, y: 0 });
     
     useEffect(() => {
-        // Check if the Web Share API is supported by the browser for file sharing.
         if (navigator.share && typeof navigator.canShare === 'function' && navigator.canShare({ files: [new File([], "test.jpg", {type: "image/jpeg"})] })) {
             setIsShareSupported(true);
         }
     }, []);
 
-    // Reset states when the image URL changes or status goes to pending.
     useEffect(() => {
         if (status === 'pending') {
             setIsDeveloped(false);
@@ -114,26 +150,24 @@ const PolaroidCard: React.FC<PolaroidCardProps> = ({ imageUrl, caption, descript
         }
     }, [imageUrl, status]);
 
-    // When the image is loaded, start the developing animation.
     useEffect(() => {
         if (isImageLoaded) {
             const timer = setTimeout(() => {
                 setIsDeveloped(true);
-            }, 200); // Short delay before animation starts
+            }, 200);
             return () => clearTimeout(timer);
         }
     }, [isImageLoaded]);
 
-    // This effect runs when a shake is detected to sequence the animation and regeneration.
     useEffect(() => {
         if (isShaking) {
             const animateAndRegenerate = async () => {
                 if (cardBodyRef.current && onShake) {
                     await cardBodyRef.current.shake();
                     onShake(caption);
-                    setIsShaking(false); // Reset for next time
+                    setIsShaking(false);
                 } else {
-                    setIsShaking(false); // Ensure reset even if conditions fail
+                    setIsShaking(false);
                 }
             };
             animateAndRegenerate();
@@ -142,110 +176,95 @@ const PolaroidCard: React.FC<PolaroidCardProps> = ({ imageUrl, caption, descript
 
 
     const handleDragStart = () => {
-        // Reset velocity on new drag to prevent false triggers from old data
         lastVelocity.current = { x: 0, y: 0 };
     };
 
-    // FIX: Replace `PanInfo` with `any` for the `info` parameter to resolve the type error.
     const handleDrag = (event: MouseEvent | TouchEvent | PointerEvent, info: any) => {
         if (!onShake || isMobile) return;
-
-        const velocityThreshold = 1200; // Lowered for better feel with visual feedback
-        const shakeCooldown = 2000; // 2 seconds cooldown to prevent spamming.
-
+        const velocityThreshold = 1200;
+        const shakeCooldown = 2000;
         const { x, y } = info.velocity;
         const { x: prevX, y: prevY } = lastVelocity.current;
         const now = Date.now();
-
-        // A true "shake" is a rapid movement AND a sharp change in direction.
-        // We detect this by checking if the velocity is high and if its direction
-        // has reversed from the last frame (i.e., the dot product is negative).
         const magnitude = Math.sqrt(x * x + y * y);
         const dotProduct = (x * prevX) + (y * prevY);
 
         if (magnitude > velocityThreshold && dotProduct < 0 && (now - lastShakeTime.current > shakeCooldown) && !isShaking) {
             lastShakeTime.current = now;
-            setIsShaking(true); // This will trigger the useEffect
+            setIsShaking(true);
         }
-
         lastVelocity.current = { x, y };
+    };
+
+    const handleDownloadClick = (e: React.MouseEvent) => {
+        e.stopPropagation();
+        if (!onDownload) return;
+
+        setIsDownloading(true);
+        onDownload(caption);
+        
+        // Reset the loading state after a short delay to provide visual feedback
+        setTimeout(() => {
+            setIsDownloading(false);
+        }, 1000);
     };
 
     const cardInnerContent = (
         <>
-            <div className="w-full bg-neutral-900 shadow-inner flex-grow relative overflow-hidden group">
+            <div className="w-full bg-neutral-900 shadow-inner flex-grow relative overflow-hidden group" onClick={() => videoUrl && onViewVideo && onViewVideo(caption)}>
                 {status === 'pending' && <DevelopingIndicator progress={progress} />}
                 {status === 'error' && <ErrorDisplay onRetry={onShake ? () => onShake(caption) : undefined} isMobile={isMobile} errorMessage={error} />}
                 {status === 'done' && imageUrl && (
                     <>
+                        {videoUrl && (
+                            <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none">
+                                <div className="w-12 h-12 bg-black/50 rounded-full flex items-center justify-center">
+                                     <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 text-white" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" /></svg>
+                                </div>
+                            </div>
+                        )}
                         <div className={cn(
-                            "absolute top-2 right-2 z-20 flex flex-col gap-2 transition-opacity duration-300",
+                            "absolute top-2 right-2 z-30 flex flex-col gap-2 transition-opacity duration-300",
                             !isMobile && "opacity-0 group-hover:opacity-100",
                         )}>
+                            {onPlayAudio && (
+                                <ActionButton onClick={() => onPlayAudio(caption)} aria-label={`Play audio for ${caption}`} isLoading={isAudioLoading}>
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M5.5 16a3.5 3.5 0 01-.369-6.98 4 4 0 117.753-1.977A4.5 4.5 0 1113.5 16h-8z" /></svg>
+                                </ActionButton>
+                            )}
+                            {onEdit && (
+                                <ActionButton onClick={() => onEdit(caption)} aria-label={`Edit image for ${caption}`}>
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M11.3 1.046A1 1 0 0112 2v1.069l4.98 2.49a1 1 0 01.684 1.246l-1.388 4.162a1 1 0 01-1.246.684l-4.162-1.388a1 1 0 01-.684-1.246L12.182 4.02 9.98 6.222a1 1 0 01-1.414 0l-2.829-2.828a1 1 0 010-1.414l2.222-2.222L5.97 1.393a1 1 0 01-1.246-.684L3.062 4.98A1 1 0 011.816 4.3L.428 2.912a1 1 0 01.684-1.246L5.09.278a1 1 0 011.246.684l.393.982 2.222-2.222a1 1 0 011.349.024zm2.385 8.225l1.388-4.162-4.98-2.49V2a1 1 0 01-.293-.707L8.476 5.524l2.828 2.828 2.381-.794zM2 12a1 1 0 011-1h1a1 1 0 110 2H3a1 1 0 01-1-1zm3 3a1 1 0 011-1h1a1 1 0 110 2H6a1 1 0 01-1-1zm3-6a1 1 0 011-1h1a1 1 0 110 2H9a1 1 0 01-1-1zm-3 3a1 1 0 011-1h1a1 1 0 110 2H6a1 1 0 01-1-1zm11.5-3.5a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0zm-3.5 6.5a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0z" clipRule="evenodd" /></svg>
+                                </ActionButton>
+                            )}
+                            {onAnimate && !videoUrl && (
+                                <ActionButton onClick={() => onAnimate(caption)} aria-label={`Animate image for ${caption}`} isLoading={isAnimating}>
+                                     <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M2 6a2 2 0 012-2h4l2 2h4a2 2 0 012 2v1H8a3 3 0 00-3 3v1.5a1.5 1.5 0 01-3 0V6z" clipRule="evenodd" /><path d="M6 12a2 2 0 012-2h8a2 2 0 012 2v2a2 2 0 01-2 2H8a2 2 0 01-2-2v-2z" /></svg>
+                                </ActionButton>
+                            )}
                             {onShare && isShareSupported && (
-                                <button
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        onShare(caption);
-                                    }}
-                                    className="p-2 bg-black/50 rounded-full text-white hover:bg-black/75 focus:outline-none focus:ring-2 focus:ring-white"
-                                    aria-label={`Share image for ${caption}`}
-                                >
-                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                                        <path d="M15 8a3 3 0 10-2.977-2.63l-4.94 2.47a3 3 0 100 4.319l4.94 2.47a3 3 0 10.895-1.789l-4.94-2.47a3.027 3.027 0 000-.74l4.94-2.47C13.456 7.68 14.19 8 15 8z" />
-                                    </svg>
-                                </button>
+                                <ActionButton onClick={() => onShare(caption)} aria-label={`Share image for ${caption}`}>
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M15 8a3 3 0 10-2.977-2.63l-4.94 2.47a3 3 0 100 4.319l4.94 2.47a3 3 0 10.895-1.789l-4.94-2.47a3.027 3.027 0 000-.74l4.94-2.47C13.456 7.68 14.19 8 15 8z" /></svg>
+                                </ActionButton>
                             )}
                             {onDownload && (
-                                <button
-                                    onClick={(e) => {
-                                        e.stopPropagation(); // Prevent drag from starting on click
-                                        onDownload(caption);
-                                    }}
-                                    className="p-2 bg-black/50 rounded-full text-white hover:bg-black/75 focus:outline-none focus:ring-2 focus:ring-white"
-                                    aria-label={`Download image for ${caption}`}
-                                >
-                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                                        <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                                    </svg>
-                                </button>
+                                <ActionButton onClick={handleDownloadClick} aria-label={`Download image for ${caption}`} isLoading={isDownloading}>
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                </ActionButton>
                             )}
                              {isMobile && onShake && (
-                                <button
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        onShake(caption);
-                                    }}
-                                    className="p-2 bg-black/50 rounded-full text-white hover:bg-black/75 focus:outline-none focus:ring-2 focus:ring-white"
-                                    aria-label={`Regenerate image for ${caption}`}
-                                >
-                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                                        <path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.899 2.186l-1.42.71a5.002 5.002 0 00-8.479-1.554H10a1 1 0 110 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm12 14a1 1 0 01-1-1v-2.101a7.002 7.002 0 01-11.899-2.186l1.42-.71a5.002 5.002 0 008.479 1.554H10a1 1 0 110 2h6a1 1 0 011 1v6a1 1 0 01-1 1z" clipRule="evenodd" />
-                                    </svg>
-                                </button>
+                                <ActionButton onClick={() => onShake(caption)} aria-label={`Regenerate image for ${caption}`}>
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.899 2.186l-1.42.71a5.002 5.002 0 00-8.479-1.554H10a1 1 0 110 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm12 14a1 1 0 01-1-1v-2.101a7.002 7.002 0 01-11.899-2.186l1.42-.71a5.002 5.002 0 008.479 1.554H10a1 1 0 110 2h6a1 1 0 011 1v6a1 1 0 01-1 1z" clipRule="evenodd" /></svg>
+                                </ActionButton>
                             )}
                         </div>
-
-
-                        {/* The developing chemical overlay - fades out */}
-                        <div
-                            className={`absolute inset-0 z-10 bg-[#3a322c] transition-opacity duration-[3500ms] ease-out ${
-                                isDeveloped ? 'opacity-0' : 'opacity-100'
-                            }`}
-                            aria-hidden="true"
-                        />
-                        
-                        {/* The Image - fades in and color corrects */}
+                        <div className={`absolute inset-0 z-10 bg-[#3a322c] transition-opacity duration-[3500ms] ease-out ${isDeveloped ? 'opacity-0' : 'opacity-100'}`} aria-hidden="true" />
                         <img
                             key={imageUrl}
                             src={imageUrl}
                             alt={caption}
                             onLoad={() => setIsImageLoaded(true)}
-                            className={`w-full h-full object-cover transition-all duration-[4000ms] ease-in-out ${
-                                isDeveloped 
-                                ? 'opacity-100 filter-none' 
-                                : 'opacity-80 filter sepia(1) contrast(0.8) brightness(0.8)'
-                            }`}
+                            className={`w-full h-full object-cover transition-all duration-[4000ms] ease-in-out ${ isDeveloped ? 'opacity-100 filter-none' : 'opacity-80 filter sepia(1) contrast(0.8) brightness(0.8)' }`}
                             style={{ opacity: isImageLoaded ? undefined : 0 }}
                         />
                     </>
@@ -270,30 +289,42 @@ const PolaroidCard: React.FC<PolaroidCardProps> = ({ imageUrl, caption, descript
                 <div className="bg-neutral-100 dark:bg-neutral-100 !p-3 !pb-12 flex flex-col items-center justify-start aspect-[3/4] w-full rounded-md shadow-lg relative">
                     {cardInnerContent}
                 </div>
-                {/* Description removed for a cleaner grid view on mobile */}
             </div>
         );
     }
 
     return (
-        <DraggableCardContainer>
-            <DraggableCardBody 
-                ref={cardBodyRef}
-                className="bg-neutral-100 dark:bg-neutral-100 !p-4 !pb-16 flex flex-col items-center justify-start aspect-[3/4] w-72 sm:w-80 max-w-full"
-                dragConstraintsRef={dragConstraintsRef}
-                onDragStart={handleDragStart}
-                onDrag={handleDrag}
-            >
-                {cardInnerContent}
-                {description && (
-                    <div className="absolute top-full left-0 right-0 mt-3 flex justify-center pointer-events-none">
-                        <p className="text-neutral-300 text-xs text-center w-72 sm:w-80">
-                            {description}
-                        </p>
-                    </div>
+        <div
+            className="relative"
+            onMouseEnter={() => setIsHovered(true)}
+            onMouseLeave={() => setIsHovered(false)}
+        >
+            <AnimatePresence>
+                {isHovered && description && (
+                    <motion.div
+                        initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                        transition={{ duration: 0.2, ease: 'easeOut' }}
+                        className="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 w-72 sm:w-80 max-w-[90vw] p-3 bg-neutral-900/90 backdrop-blur-sm text-neutral-200 text-sm leading-relaxed rounded-md shadow-lg z-50 pointer-events-none border border-neutral-700"
+                        style={{ transformOrigin: 'bottom center' }}
+                    >
+                        <p className="text-center">{description}</p>
+                    </motion.div>
                 )}
-            </DraggableCardBody>
-        </DraggableCardContainer>
+            </AnimatePresence>
+            <DraggableCardContainer>
+                <DraggableCardBody 
+                    ref={cardBodyRef}
+                    className="bg-neutral-100 dark:bg-neutral-100 !p-4 !pb-16 flex flex-col items-center justify-start aspect-[3/4] w-72 sm:w-80 max-w-full"
+                    dragConstraintsRef={dragConstraintsRef}
+                    onDragStart={handleDragStart}
+                    onDrag={handleDrag}
+                >
+                    {cardInnerContent}
+                </DraggableCardBody>
+            </DraggableCardContainer>
+        </div>
     );
 };
 

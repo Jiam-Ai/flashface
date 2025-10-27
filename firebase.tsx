@@ -2,10 +2,9 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
 */
-// FIX: The `getAuth` member is not exported from 'firebase/auth'.
-// Using the compat library for initialization to resolve this.
 import firebase from "firebase/compat/app";
 import "firebase/compat/auth";
+import "firebase/compat/firestore";
 
 // TODO: Replace with your app's Firebase project configuration.
 // You can get this from the Firebase console for your web app.
@@ -21,7 +20,8 @@ const firebaseConfig = {
 };
 
 // Initialize Firebase
-const app = firebase.initializeApp(firebaseConfig);
+const app = !firebase.apps.length ? firebase.initializeApp(firebaseConfig) : firebase.app();
 
-// Export the auth instance to be used in other parts of the app
+// Export the auth and firestore instances to be used in other parts of the app
 export const auth = app.auth();
+export const db = app.firestore();

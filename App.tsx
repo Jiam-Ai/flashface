@@ -4,17 +4,16 @@
 */
 import React, { useState, ChangeEvent, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { generateDecadeImage } from './services/geminiService';
+import { generateDecadeImage, generateAudioDescription, generateDecadeVideo, editDecadeImage } from './services/geminiService';
 import PolaroidCard from './components/PolaroidCard';
 import { createAlbumPage } from './lib/albumUtils';
 import Footer from './components/Footer';
 import CameraCapture from './components/CameraCapture';
 import AuthPage from './components/AuthPage';
-import { auth } from './firebase';
-// FIX: The User, onAuthStateChanged, and signOut members are not exported from 'firebase/auth'.
-// Using the compat library and v8 namespaced syntax instead.
+import { auth, db } from './firebase';
 import firebase from 'firebase/compat/app';
 import ProfilePage from './components/ProfilePage';
+import { decode } from './lib/audioUtils';
 
 
 const DECADES = ['1900s', '1910s', '1920s', '1930s', '1940s', '1950s', '1960s', '1970s', '1980s', '1990s', '2000s', '2010s'];
@@ -78,15 +77,28 @@ const GHOST_POLAROIDS_CONFIG = [
 
 
 type ImageStatus = 'pending' | 'done' | 'error';
+type FeatureStatus = 'idle' | 'pending' | 'done' | 'error';
+
 interface GeneratedImage {
     status: ImageStatus;
     url?: string;
     error?: string;
+    videoUrl?: string;
+    videoStatus?: FeatureStatus;
+    audioStatus?: FeatureStatus;
 }
 interface UserProfile {
     displayName: string;
     avatar?: string;
 }
+interface Session {
+    id: string;
+    createdAt: firebase.firestore.Timestamp;
+    uploadedImage: string;
+    generatedImages: Record<string, GeneratedImage>;
+    generatedDecades: string[];
+}
+
 
 const primaryButtonClasses = "font-permanent-marker text-base sm:text-xl text-center text-cyan-300 bg-cyan-900/20 border-2 border-cyan-400 py-2 px-5 sm:py-3 sm:px-8 rounded-sm transform transition-all duration-300 hover:scale-105 hover:-rotate-2 hover:bg-cyan-400 hover:text-black hover:shadow-[0_0_20px_theme(colors.cyan.400)] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:rotate-0 disabled:hover:shadow-none";
 const secondaryButtonClasses = "font-permanent-marker text-base sm:text-xl text-center text-cyan-400 bg-transparent border-2 border-cyan-400/50 py-2 px-5 sm:py-3 sm:px-8 rounded-sm transform transition-all duration-300 hover:scale-105 hover:rotate-2 hover:bg-cyan-400/10 hover:border-cyan-400";
@@ -105,8 +117,41 @@ const useMediaQuery = (query: string) => {
     return matches;
 };
 
-const UserDisplay = ({ profile, onEditProfile }: { profile: UserProfile, onEditProfile: () => void }) => (
-    <div className="absolute top-6 right-6 z-20">
+// --- Helper Functions for Audio Playback ---
+async function decodeAudioData(
+    data: Uint8Array,
+    ctx: AudioContext,
+    sampleRate: number,
+    numChannels: number,
+): Promise<AudioBuffer> {
+    const dataInt16 = new Int16Array(data.buffer);
+    const frameCount = dataInt16.length / numChannels;
+    const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+
+    for (let channel = 0; channel < numChannels; channel++) {
+        const channelData = buffer.getChannelData(channel);
+        for (let i = 0; i < frameCount; i++) {
+            channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+        }
+    }
+    return buffer;
+}
+
+
+// --- New UI Components ---
+
+const UserDisplay = ({ profile, onEditProfile, onShowHistory }: { profile: UserProfile, onEditProfile: () => void, onShowHistory: () => void }) => (
+    <div className="absolute top-6 right-6 z-20 flex items-center gap-4">
+        <button
+            onClick={onShowHistory}
+            className="flex items-center gap-2 group"
+            aria-label="View your generation history"
+        >
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-7 w-7 text-neutral-500 group-hover:text-cyan-400 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span className="font-permanent-marker text-neutral-400 group-hover:text-cyan-400 transition-colors hidden md:inline">History</span>
+        </button>
         <button
             onClick={onEditProfile}
             className="flex items-center gap-3 group"
@@ -126,23 +171,212 @@ const UserDisplay = ({ profile, onEditProfile }: { profile: UserProfile, onEditP
     </div>
 );
 
+
+const HistoryPanel = ({ sessions, onLoadSession, onClose }: { sessions: Session[], onLoadSession: (session: Session) => void, onClose: () => void }) => (
+    <motion.div
+        initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+        className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center z-50 p-4"
+        onClick={onClose}
+    >
+        <motion.div
+            initial={{ scale: 0.9, y: 20 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.9, y: 20 }}
+            className="w-full max-w-4xl h-[80vh] bg-black/30 rounded-lg border border-cyan-500/20 shadow-xl p-6 sm:p-8 flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+        >
+            <div className="flex justify-between items-center mb-6">
+                <h2 className="font-permanent-marker text-2xl sm:text-3xl text-neutral-200">Time Travel Log</h2>
+                <button onClick={onClose} className="text-neutral-500 hover:text-white transition-colors">&times;</button>
+            </div>
+            {sessions.length === 0 ? (
+                <div className="flex-1 flex flex-col items-center justify-center text-neutral-500">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1}><path strokeLinecap="round" strokeLinejoin="round" d="M4 8v10a2 2 0 002 2h12a2 2 0 002-2V8m-6 4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                    <p className="font-permanent-marker text-lg">No history yet.</p>
+                    <p>Your generated albums will appear here.</p>
+                </div>
+            ) : (
+                <div className="flex-1 overflow-y-auto grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4 pr-2">
+                    {sessions.map(session => (
+                        <motion.button
+                            key={session.id}
+                            onClick={() => onLoadSession(session)}
+                            className="aspect-square bg-neutral-900 rounded-md overflow-hidden group relative border-2 border-transparent hover:border-cyan-400 focus:border-cyan-400 transition-all duration-300"
+                            whileHover={{ scale: 1.05 }}
+                            whileTap={{ scale: 0.98 }}
+                        >
+                            <img src={session.uploadedImage} alt="Uploaded" className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-300" />
+                            <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent" />
+                            <p className="absolute bottom-2 left-2 right-2 text-white text-xs font-bold truncate">
+                                {session.createdAt.toDate().toLocaleDateString()}
+                            </p>
+                        </motion.button>
+                    ))}
+                </div>
+            )}
+        </motion.div>
+    </motion.div>
+);
+
+const VideoPlayerModal = ({ decade, videoUrl, onClose }: { decade: string, videoUrl: string, onClose: () => void }) => (
+    <motion.div
+        initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+        className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center z-50 p-4"
+        onClick={onClose}
+    >
+        <motion.div
+            initial={{ scale: 0.9, y: 20 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.9, y: 20 }}
+            className="w-full max-w-2xl bg-black/50 rounded-lg border border-cyan-500/20 shadow-xl p-4 flex flex-col items-center"
+            onClick={(e) => e.stopPropagation()}
+        >
+            <h2 className="font-permanent-marker text-xl sm:text-2xl text-neutral-200 mb-4">{decade} - In Motion</h2>
+            <video src={videoUrl} controls autoPlay loop className="w-full rounded-md" />
+            <button onClick={onClose} className={`${secondaryButtonClasses} mt-4 !text-base`}>Close</button>
+        </motion.div>
+    </motion.div>
+);
+
+const ApiKeyPrompt = ({ onSelectKey, onClose }: { onSelectKey: () => void, onClose: () => void }) => (
+     <motion.div
+        initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+        className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center z-50 p-4"
+    >
+        <motion.div
+            initial={{ scale: 0.9, y: 20 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.9, y: 20 }}
+            className="w-full max-w-md bg-black/50 rounded-lg border border-cyan-500/20 shadow-xl p-6 flex flex-col items-center text-center"
+        >
+            <h2 className="font-permanent-marker text-xl sm:text-2xl text-neutral-200 mb-2">API Key Required</h2>
+            <p className="text-neutral-400 mb-4">The video generation feature requires you to select your own Google AI API key. This is a free feature during the preview period.</p>
+            <p className="text-xs text-neutral-500 mb-6">For more information on future billing, see the <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" rel="noopener noreferrer" className="text-cyan-400 underline">billing documentation</a>.</p>
+            <div className="flex gap-4">
+                <button onClick={onClose} className={secondaryButtonClasses}>Cancel</button>
+                <button onClick={onSelectKey} className={primaryButtonClasses}>Select API Key</button>
+            </div>
+        </motion.div>
+    </motion.div>
+);
+
+const VideoOptionsModal = ({ decade, onClose, onStartAnimation }: { decade: string | null; onClose: () => void; onStartAnimation: (decade: string, aspectRatio: '9:16' | '16:9') => void; }) => {
+    if (!decade) return null;
+
+    const handleSelect = (aspectRatio: '9:16' | '16:9') => {
+        onStartAnimation(decade, aspectRatio);
+        onClose();
+    };
+
+    return (
+        <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center z-50 p-4"
+            onClick={onClose}
+        >
+            <motion.div
+                initial={{ scale: 0.9, y: 20 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.9, y: 20 }}
+                className="w-full max-w-md bg-black/50 rounded-lg border border-cyan-500/20 shadow-xl p-6 sm:p-8 flex flex-col items-center text-center"
+                onClick={(e) => e.stopPropagation()}
+            >
+                <h2 className="font-permanent-marker text-xl sm:text-2xl text-neutral-200 mb-2">Animate '{decade}'</h2>
+                <p className="text-neutral-400 mb-6">Choose an aspect ratio for your video.</p>
+                <div className="flex flex-col sm:flex-row gap-4 w-full">
+                    <button onClick={() => handleSelect('9:16')} className={`${primaryButtonClasses} w-full`}>Portrait (9:16)</button>
+                    <button onClick={() => handleSelect('16:9')} className={`${primaryButtonClasses} w-full`}>Landscape (16:9)</button>
+                </div>
+                 <button onClick={onClose} className={`${secondaryButtonClasses} mt-6 !text-base`}>Cancel</button>
+            </motion.div>
+        </motion.div>
+    );
+};
+
+const ImageEditModal = ({ editingImage, onClose, onApplyEdit }: { editingImage: { decade: string; url: string; } | null; onClose: () => void; onApplyEdit: (decade: string, prompt: string) => Promise<void>; }) => {
+    const [prompt, setPrompt] = useState('');
+    const [isEditing, setIsEditing] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (editingImage) {
+            setPrompt('');
+            setIsEditing(false);
+            setError(null);
+        }
+    }, [editingImage]);
+
+    if (!editingImage) return null;
+
+    const handleSubmit = async () => {
+        if (!prompt.trim()) {
+            setError("Please enter an edit instruction.");
+            return;
+        }
+        setIsEditing(true);
+        setError(null);
+        try {
+            await onApplyEdit(editingImage.decade, prompt);
+        } catch (err) {
+            setError(parseErrorMessage(err));
+        } finally {
+            setIsEditing(false);
+        }
+    };
+    
+    return (
+        <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center z-50 p-4"
+            onClick={onClose}
+        >
+            <motion.div
+                initial={{ scale: 0.9, y: 20 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.9, y: 20 }}
+                className="w-full max-w-md bg-black/50 rounded-lg border border-cyan-500/20 shadow-xl p-6 sm:p-8 flex flex-col items-center"
+                onClick={(e) => e.stopPropagation()}
+            >
+                <h2 className="font-permanent-marker text-xl sm:text-2xl text-neutral-200 mb-4">Edit '{editingImage.decade}'</h2>
+                <img src={editingImage.url} alt={`Image for ${editingImage.decade}`} className="w-48 aspect-[3/4] object-cover rounded-sm mb-4 border-2 border-neutral-700" />
+                <textarea
+                    value={prompt}
+                    onChange={(e) => setPrompt(e.target.value)}
+                    placeholder="e.g., 'Add a retro film grain effect' or 'Make the background a 1920s jazz club...'"
+                    className="w-full h-24 p-2 text-base text-neutral-200 bg-neutral-900/50 border-2 border-neutral-600 rounded-md focus:outline-none focus:ring-2 focus:ring-cyan-400 transition-colors"
+                />
+                {error && <p className="text-red-400 text-sm text-center mt-3">{error}</p>}
+                <div className="flex gap-4 mt-6">
+                    <button onClick={onClose} className={secondaryButtonClasses} disabled={isEditing}>Cancel</button>
+                    <button onClick={handleSubmit} className={primaryButtonClasses} disabled={isEditing}>
+                        {isEditing ? 'Applying...' : 'Apply Edit'}
+                    </button>
+                </div>
+            </motion.div>
+        </motion.div>
+    );
+};
+
+
 // User-friendly error message parser
 const parseErrorMessage = (error: unknown): string => {
     const message = error instanceof Error ? error.message : String(error);
 
-    // This often happens due to safety filters or the model not understanding the image request.
+    // Image Generation & Editing Errors
     if (message.includes("responded with text instead of an image")) {
         return "The AI couldn't create an image, possibly due to safety filters. Try a different photo or decade.";
     }
-    // This indicates a persistent issue with the generation for this specific request.
     if (message.includes("failed with both original and fallback prompts")) {
         return "The AI failed after multiple attempts. Please try again later or with a different photo.";
     }
-    // This is for other, less specific API errors.
     if (message.includes("failed to generate an image")) {
-        return "An unexpected error occurred during generation. Please check your connection and try again.";
+        return "An unexpected error occurred during image generation. Please check your connection and try again.";
     }
-    // A generic fallback for anything else.
+     if (message.includes("failed to edit the image")) {
+        return "The AI failed to edit the image. This could be due to safety filters or a complex request. Try a different instruction.";
+    }
+
+    // Video Generation Errors
+    if (message.includes("API key not valid") || message.includes("API_KEY_INVALID") || message.includes("Requested entity was not found.")) {
+         return "API Key error. Please ensure your key is valid and has the 'Generative Language API' enabled, then re-select it and try again.";
+    }
+    if (message.includes("prompt was blocked")) {
+        return "The video request was blocked due to safety filters. Please try a different photo or decade.";
+    }
+    if (message.includes("Video generation failed")) {
+         return "The AI failed to create a video. This can happen with complex requests or a temporary service issue. Please try again.";
+    }
+
     return "An unknown error occurred. Please try again.";
 };
 
@@ -151,7 +385,10 @@ function App() {
     const [authStatus, setAuthStatus] = useState<'loading' | 'authenticated' | 'unauthenticated'>('loading');
     const [user, setUser] = useState<firebase.User | null>(null);
     const [profile, setProfile] = useState<UserProfile>({ displayName: '', avatar: undefined });
+    const [sessions, setSessions] = useState<Session[]>([]);
+    const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
     const [isProfileOpen, setIsProfileOpen] = useState(false);
+    const [isHistoryOpen, setIsHistoryOpen] = useState(false);
     const [uploadedImage, setUploadedImage] = useState<string | null>(null);
     const [generatedImages, setGeneratedImages] = useState<Record<string, GeneratedImage>>({});
     const [isLoading, setIsLoading] = useState<boolean>(false);
@@ -162,43 +399,75 @@ function App() {
     const [selectedDecades, setSelectedDecades] = useState<string[]>(DECADES);
     const [generatedDecades, setGeneratedDecades] = useState<string[]>([]);
     const [isShareSupported, setIsShareSupported] = useState(false);
+    const [videoModal, setVideoModal] = useState<{ decade: string; url: string } | null>(null);
+    const [isApiKeyPromptOpen, setIsApiKeyPromptOpen] = useState(false);
+    const [isApiKeySelected, setIsApiKeySelected] = useState(false);
+    const [decadeToAnimate, setDecadeToAnimate] = useState<string | null>(null);
+    const [editingImage, setEditingImage] = useState<{ decade: string; url: string } | null>(null);
+    const audioContextRef = useRef<AudioContext | null>(null);
     const dragAreaRef = useRef<HTMLDivElement>(null);
     const isMobile = useMediaQuery('(max-width: 768px)');
 
+    // Authentication Listener
     useEffect(() => {
-        // FIX: Replaced onAuthStateChanged(auth, ...) with auth.onAuthStateChanged(...) and User type with firebase.User
         const unsubscribe = auth.onAuthStateChanged((user: firebase.User | null) => {
             setUser(user);
-            if (user) {
-                setAuthStatus('authenticated');
-                // Load profile from localStorage or create a default one
-                try {
-                    const storedProfile = localStorage.getItem(`past-forward-profile-${user.uid}`);
-                    if (storedProfile) {
-                        setProfile(JSON.parse(storedProfile));
-                    } else {
-                        const defaultDisplayName = user.isAnonymous ? 'Guest' : (user.email?.split('@')[0] || 'Time Traveler');
-                        setProfile({ displayName: defaultDisplayName });
-                    }
-                } catch (error) {
-                    console.error("Error loading profile from localStorage:", error);
-                    const defaultDisplayName = user.isAnonymous ? 'Guest' : (user.email?.split('@')[0] || 'Time Traveler');
-                    setProfile({ displayName: defaultDisplayName });
-                }
-            } else {
-                setAuthStatus('unauthenticated');
-                setProfile({ displayName: '', avatar: undefined }); // Clear profile on logout
+            setAuthStatus(user ? 'authenticated' : 'unauthenticated');
+            if (!user) { // Clear all state on logout
+                setProfile({ displayName: '', avatar: undefined });
+                setSessions([]);
+                handleReset();
             }
         });
-        return () => unsubscribe(); // Cleanup subscription on component unmount
+        return () => unsubscribe();
     }, []);
 
+    // Firestore Profile & Session Listener
     useEffect(() => {
+        if (user) {
+            // Profile listener
+            const profileUnsubscribe = db.collection('users').doc(user.uid).onSnapshot(doc => {
+                if (doc.exists) {
+                    setProfile(doc.data() as UserProfile);
+                } else {
+                    // Create a default profile if none exists
+                    const defaultProfile = { displayName: user.isAnonymous ? 'Guest' : (user.email?.split('@')[0] || 'Time Traveler') };
+                    db.collection('users').doc(user.uid).set(defaultProfile);
+                    setProfile(defaultProfile);
+                }
+            });
+
+            // Sessions listener
+            const sessionsUnsubscribe = db.collection('users').doc(user.uid).collection('sessions')
+                .orderBy('createdAt', 'desc')
+                .onSnapshot(snapshot => {
+                    const userSessions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Session));
+                    setSessions(userSessions);
+                });
+
+            return () => {
+                profileUnsubscribe();
+                sessionsUnsubscribe();
+            };
+        }
+    }, [user]);
+
+     useEffect(() => {
         if (navigator.share) {
             setIsShareSupported(true);
         }
+        // Initialize AudioContext on first user interaction (or effect)
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
     }, []);
 
+    const loadSession = (session: Session) => {
+        setCurrentSessionId(session.id);
+        setUploadedImage(session.uploadedImage);
+        setGeneratedImages(session.generatedImages || {});
+        setGeneratedDecades(session.generatedDecades || []);
+        setAppState('results-shown');
+        setIsHistoryOpen(false);
+    };
 
     const handleImageUpload = (e: ChangeEvent<HTMLInputElement>) => {
         if (e.target.files && e.target.files[0]) {
@@ -207,9 +476,10 @@ function App() {
             reader.onloadend = () => {
                 setUploadedImage(reader.result as string);
                 setAppState('image-uploaded');
-                setGeneratedImages({}); // Clear previous results
-                setSelectedDecades(DECADES); // Reset decade selection
+                setGeneratedImages({});
+                setSelectedDecades(DECADES);
                 setGeneratedDecades([]);
+                setCurrentSessionId(null);
             };
             reader.readAsDataURL(file);
         }
@@ -218,9 +488,10 @@ function App() {
     const handleImageCapture = (imageDataUrl: string) => {
         setUploadedImage(imageDataUrl);
         setAppState('image-uploaded');
-        setGeneratedImages({}); // Clear previous results
-        setSelectedDecades(DECADES); // Reset decade selection
+        setGeneratedImages({});
+        setSelectedDecades(DECADES);
         setGeneratedDecades([]);
+        setCurrentSessionId(null);
         setIsCameraOpen(false);
     };
 
@@ -233,7 +504,7 @@ function App() {
     };
 
     const handleGenerateClick = async () => {
-        if (!uploadedImage || selectedDecades.length === 0) return;
+        if (!uploadedImage || selectedDecades.length === 0 || !user) return;
 
         setGeneratedDecades(selectedDecades);
         setIsLoading(true);
@@ -245,30 +516,29 @@ function App() {
         });
         setGeneratedImages(initialImages);
 
-        const concurrencyLimit = 2; // Process two decades at a time
+        // Create new session in Firestore
+        const newSessionRef = db.collection('users').doc(user.uid).collection('sessions').doc();
+        setCurrentSessionId(newSessionRef.id);
+        await newSessionRef.set({
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+            uploadedImage,
+            generatedDecades: selectedDecades,
+            generatedImages: initialImages,
+        });
+
+        const concurrencyLimit = 2;
         const decadesQueue = [...selectedDecades];
 
         const processDecade = async (decade: string) => {
             try {
-                const prompt = `You are an expert fashion historian and photographer. Your task is to reimagine the person in this photo as if they were living in the ${decade}.
-
-**Primary Goal**: Create a photorealistic image that is authentic to the ${decade}. The person's face and key features must be clearly recognizable.
-
-**Key Elements**:
-1.  **Clothing & Hairstyle**: Must be strictly era-appropriate for the ${decade}.
-2.  **Photographic Style**: The image must visually match the photography of the era. Follow these specific style guidelines: *${DECADE_STYLES[decade]}*
-3.  **Output Format**: The output must be ONLY the image. Do not include any text, captions, or descriptions.`;
+                const prompt = `You are an expert fashion historian and photographer. Your task is to reimagine the person in this photo as if they were living in the ${decade}. **Primary Goal**: Create a photorealistic image that is authentic to the ${decade}. The person's face and key features must be clearly recognizable. **Key Elements**: 1.  **Clothing & Hairstyle**: Must be strictly era-appropriate for the ${decade}. 2.  **Photographic Style**: The image must visually match the photography of the era. Follow these specific style guidelines: *${DECADE_STYLES[decade]}* 3.  **Output Format**: The output must be ONLY the image. Do not include any text, captions, or descriptions.`;
                 const resultUrl = await generateDecadeImage(uploadedImage, prompt);
-                setGeneratedImages(prev => ({
-                    ...prev,
-                    [decade]: { status: 'done', url: resultUrl },
-                }));
+                setGeneratedImages(prev => ({ ...prev, [decade]: { status: 'done', url: resultUrl } }));
+                await newSessionRef.update({ [`generatedImages.${decade}`]: { status: 'done', url: resultUrl } });
             } catch (err) {
                 const userFriendlyError = parseErrorMessage(err);
-                setGeneratedImages(prev => ({
-                    ...prev,
-                    [decade]: { status: 'error', error: userFriendlyError },
-                }));
+                setGeneratedImages(prev => ({ ...prev, [decade]: { status: 'error', error: userFriendlyError } }));
+                await newSessionRef.update({ [`generatedImages.${decade}`]: { status: 'error', error: userFriendlyError } });
                 console.error(`Failed to generate image for ${decade}:`, err);
             }
         };
@@ -283,49 +553,122 @@ function App() {
         });
 
         await Promise.all(workers);
-
         setIsLoading(false);
         setAppState('results-shown');
     };
 
     const handleRegenerateDecade = async (decade: string) => {
-        if (!uploadedImage) return;
-
-        // Prevent re-triggering if a generation is already in progress
-        if (generatedImages[decade]?.status === 'pending') {
-            return;
-        }
+        if (!uploadedImage || !user || !currentSessionId) return;
+        if (generatedImages[decade]?.status === 'pending') return;
         
-        console.log(`Regenerating image for ${decade}...`);
-
-        // Set the specific decade to 'pending' to show the loading spinner
-        setGeneratedImages(prev => ({
-            ...prev,
-            [decade]: { status: 'pending' },
-        }));
-
-        // Call the generation service for the specific decade
+        setGeneratedImages(prev => ({ ...prev, [decade]: { status: 'pending' } }));
+        await db.collection('users').doc(user.uid).collection('sessions').doc(currentSessionId).update({ [`generatedImages.${decade}`]: { status: 'pending' } });
+        
         try {
-            const prompt = `You are an expert fashion historian and photographer. Your task is to reimagine the person in this photo as if they were living in the ${decade}.
-
-**Primary Goal**: Create a photorealistic image that is authentic to the ${decade}. The person's face and key features must be clearly recognizable.
-
-**Key Elements**:
-1.  **Clothing & Hairstyle**: Must be strictly era-appropriate for the ${decade}.
-2.  **Photographic Style**: The image must visually match the photography of the era. Follow these specific style guidelines: *${DECADE_STYLES[decade]}*
-3.  **Output Format**: The output must be ONLY the image. Do not include any text, captions, or descriptions.`;
+            const prompt = `You are an expert fashion historian and photographer. Your task is to reimagine the person in this photo as if they were living in the ${decade}. **Primary Goal**: Create a photorealistic image that is authentic to the ${decade}. The person's face and key features must be clearly recognizable. **Key Elements**: 1.  **Clothing & Hairstyle**: Must be strictly era-appropriate for the ${decade}. 2.  **Photographic Style**: The image must visually match the photography of the era. Follow these specific style guidelines: *${DECADE_STYLES[decade]}* 3.  **Output Format**: The output must be ONLY the image. Do not include any text, captions, or descriptions.`;
             const resultUrl = await generateDecadeImage(uploadedImage, prompt);
-            setGeneratedImages(prev => ({
-                ...prev,
-                [decade]: { status: 'done', url: resultUrl },
-            }));
+            const update = { status: 'done', url: resultUrl };
+            setGeneratedImages(prev => ({ ...prev, [decade]: update }));
+            await db.collection('users').doc(user.uid).collection('sessions').doc(currentSessionId).update({ [`generatedImages.${decade}`]: update });
         } catch (err) {
             const userFriendlyError = parseErrorMessage(err);
-            setGeneratedImages(prev => ({
-                ...prev,
-                [decade]: { status: 'error', error: userFriendlyError },
-            }));
+            const update = { status: 'error', error: userFriendlyError };
+            setGeneratedImages(prev => ({ ...prev, [decade]: update }));
+            await db.collection('users').doc(user.uid).collection('sessions').doc(currentSessionId).update({ [`generatedImages.${decade}`]: update });
             console.error(`Failed to regenerate image for ${decade}:`, err);
+        }
+    };
+
+    const handlePlayAudio = async (decade: string) => {
+        if (!user || !currentSessionId || generatedImages[decade]?.audioStatus === 'pending') return;
+
+        setGeneratedImages(prev => ({ ...prev, [decade]: { ...prev[decade], audioStatus: 'pending' } }));
+        await db.collection('users').doc(user.uid).collection('sessions').doc(currentSessionId).update({ [`generatedImages.${decade}.audioStatus`]: 'pending' });
+
+        try {
+            const audioData = await generateAudioDescription(decade);
+            const audioBuffer = await decodeAudioData(decode(audioData), audioContextRef.current!, 24000, 1);
+            const source = audioContextRef.current!.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContextRef.current!.destination);
+            source.start();
+             setGeneratedImages(prev => ({ ...prev, [decade]: { ...prev[decade], audioStatus: 'done' } }));
+        } catch (err) {
+            console.error(`Failed to play audio for ${decade}:`, err);
+            setGeneratedImages(prev => ({ ...prev, [decade]: { ...prev[decade], audioStatus: 'error' } }));
+        }
+    };
+
+    const handleAnimateDecade = (decade: string) => {
+        const image = generatedImages[decade];
+        if (!user || !currentSessionId || !image?.url || image.videoStatus === 'pending') return;
+        setDecadeToAnimate(decade);
+    };
+    
+    const handleStartAnimation = async (decade: string, aspectRatio: '9:16' | '16:9') => {
+        setDecadeToAnimate(null); // Close the options modal
+        const image = generatedImages[decade];
+        if (!user || !currentSessionId || !image?.url) return;
+
+        const keySelected = await window.aistudio.hasSelectedApiKey();
+        if (!keySelected) {
+            setIsApiKeyPromptOpen(true);
+            return;
+        }
+        setIsApiKeySelected(true); // Assume success after check
+
+        setGeneratedImages(prev => ({ ...prev, [decade]: { ...prev[decade], videoStatus: 'pending' } }));
+        await db.collection('users').doc(user.uid).collection('sessions').doc(currentSessionId).update({ [`generatedImages.${decade}.videoStatus`]: 'pending' });
+
+        try {
+            const videoUrl = await generateDecadeVideo(image.url, decade, aspectRatio);
+            const update = { ...generatedImages[decade], videoStatus: 'done', videoUrl: videoUrl };
+            setGeneratedImages(prev => ({ ...prev, [decade]: update as GeneratedImage }));
+            await db.collection('users').doc(user.uid).collection('sessions').doc(currentSessionId).update({ [`generatedImages.${decade}`]: update });
+        } catch (err) {
+            console.error(`Failed to animate decade ${decade}:`, err);
+            const userFriendlyError = parseErrorMessage(err);
+            const update = { ...generatedImages[decade], videoStatus: 'error', error: userFriendlyError };
+            setGeneratedImages(prev => ({ ...prev, [decade]: update as GeneratedImage }));
+            await db.collection('users').doc(user.uid).collection('sessions').doc(currentSessionId).update({ [`generatedImages.${decade}.videoStatus`]: 'error' });
+
+            if (userFriendlyError.includes("API Key error")) {
+                setIsApiKeySelected(false); // Reset key state on this specific error
+            }
+        }
+    };
+    
+    const handleOpenEditModal = (decade: string) => {
+        const image = generatedImages[decade];
+        if (image?.status === 'done' && image.url) {
+            setEditingImage({ decade, url: image.url });
+        }
+    };
+
+    const handleApplyImageEdit = async (decade: string, prompt: string) => {
+        if (!editingImage || !currentSessionId || !user) return;
+
+        const originalImageState = { ...generatedImages[decade] };
+        setGeneratedImages(prev => ({ ...prev, [decade]: { ...prev[decade], status: 'pending' } }));
+        setEditingImage(null); // Close modal immediately for better UX
+
+        try {
+            const newImageUrl = await editDecadeImage(editingImage.url, prompt);
+            const update: GeneratedImage = {
+                status: 'done',
+                url: newImageUrl,
+                videoUrl: undefined,
+                videoStatus: 'idle',
+                audioStatus: 'idle',
+            };
+            setGeneratedImages(prev => ({ ...prev, [decade]: update }));
+            await db.collection('users').doc(user.uid).collection('sessions').doc(currentSessionId).update({ [`generatedImages.${decade}`]: update });
+        } catch (err) {
+            console.error(`Failed to edit image for ${decade}:`, err);
+            const userFriendlyError = parseErrorMessage(err);
+            setGeneratedImages(prev => ({ ...prev, [decade]: { ...originalImageState, status: 'error', error: userFriendlyError } }));
+            // Re-throw to be caught by the modal if it were still open, but we close it.
+            // For now, the error shows on the card.
         }
     };
     
@@ -335,27 +678,26 @@ function App() {
         setAppState('idle');
         setSelectedDecades(DECADES);
         setGeneratedDecades([]);
+        setCurrentSessionId(null);
     };
 
     const handleSignOut = async () => {
         try {
             await auth.signOut();
-            // Auth listener will change authStatus, which triggers UI update
-            handleReset(); // Also reset the app state
+            // App state is cleared by the onAuthStateChanged listener
         } catch (error) {
             console.error("Error signing out:", error);
         }
     };
 
-    const handleSaveProfile = (newProfile: UserProfile) => {
+    const handleSaveProfile = async (newProfile: UserProfile) => {
         if (user) {
             try {
-                localStorage.setItem(`past-forward-profile-${user.uid}`, JSON.stringify(newProfile));
-                setProfile(newProfile);
-                setIsProfileOpen(false); // Close modal on save
+                await db.collection('users').doc(user.uid).set(newProfile, { merge: true });
+                setIsProfileOpen(false);
             } catch (error) {
-                console.error("Error saving profile to localStorage:", error);
-                alert("Could not save your profile. Your browser might be in private mode or have storage disabled.");
+                console.error("Error saving profile to Firestore:", error);
+                alert("Could not save your profile. Please check your connection.");
             }
         }
     };
@@ -390,7 +732,6 @@ function App() {
                     console.warn("Sharing this file type is not supported.");
                 }
             } catch (error) {
-                // This error can happen if the user cancels the share dialog, so we don't alert it.
                 console.error('Error sharing individual image:', error);
             }
         }
@@ -399,7 +740,6 @@ function App() {
     const handleDownloadAlbum = async () => {
         setIsDownloading(true);
         try {
-            // FIX: Cast the result of Object.entries to correctly type `image` as `GeneratedImage` to fix errors when accessing `image.status` and `image.url`.
             const imageData = (Object.entries(generatedImages) as [string, GeneratedImage][])
                 .filter(([decade, image]) => generatedDecades.includes(decade) && image.status === 'done' && image.url)
                 .reduce((acc, [decade, image]) => {
@@ -412,12 +752,14 @@ function App() {
                 return;
             }
             if (Object.keys(imageData).length < generatedDecades.length) {
-                alert("Please wait for all selected images to finish generating before downloading the album.");
-                return;
+                const allDone = generatedDecades.every(d => generatedImages[d]?.status !== 'pending');
+                if (!allDone) {
+                    alert("Please wait for all selected images to finish generating before downloading the album.");
+                    return;
+                }
             }
 
             const albumDataUrl = await createAlbumPage(imageData);
-
             const link = document.createElement('a');
             link.href = albumDataUrl;
             link.download = 'past-forward-album.jpg';
@@ -435,7 +777,6 @@ function App() {
 
     const handleShareAlbum = async () => {
         if (!isShareSupported) return;
-
         setIsSharing(true);
         try {
             const imageData = (Object.entries(generatedImages) as [string, GeneratedImage][])
@@ -471,9 +812,6 @@ function App() {
         }
     };
 
-
-    // Calculate progress for the loading bar
-    // FIX: Cast the result of Object.values to correctly type `img` as `GeneratedImage` and prevent a type error on `img.status`.
     const completedCount = (Object.values(generatedImages) as GeneratedImage[]).filter(img => img.status !== 'pending').length;
     const totalCount = generatedDecades.length;
     const progressPercentage = totalCount > 0 ? (completedCount / totalCount) * 100 : 0;
@@ -484,7 +822,6 @@ function App() {
             
             <AnimatePresence mode="wait">
                 {authStatus === 'loading' && (
-                    // @ts-ignore
                     <motion.div key="loader" className="z-10 flex items-center justify-center flex-1" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
                         <svg className="animate-spin h-12 w-12 text-cyan-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
@@ -496,7 +833,6 @@ function App() {
                     <AuthPage key="auth" />
                 )}
                 {authStatus === 'authenticated' && (
-                    // @ts-ignore
                     <motion.div
                         key="app"
                         initial={{ opacity: 0, y: 20 }}
@@ -505,7 +841,7 @@ function App() {
                         transition={{ duration: 0.5 }}
                         className="z-10 flex flex-col items-center justify-center w-full h-full flex-1 min-h-0"
                     >
-                        <UserDisplay profile={profile} onEditProfile={() => setIsProfileOpen(true)} />
+                        <UserDisplay profile={profile} onEditProfile={() => setIsProfileOpen(true)} onShowHistory={() => setIsHistoryOpen(true)} />
                         <div className="text-center mb-6 sm:mb-10">
                             <h1 className="text-5xl sm:text-7xl font-caveat font-bold text-neutral-100">Past Forward</h1>
                             <p className="font-permanent-marker text-cyan-400/80 mt-2 text-base sm:text-xl tracking-wide">Generate yourself through the decades.</p>
@@ -513,26 +849,15 @@ function App() {
 
                         {appState === 'idle' && (
                             <div className="relative flex flex-col items-center justify-center w-full">
-                                {/* Ghost polaroids for intro animation */}
                                 {GHOST_POLAROIDS_CONFIG.map((config, index) => (
-                                    // @ts-ignore
                                     <motion.div
                                         key={index}
                                         className="absolute w-80 h-[26rem] rounded-md p-4 bg-cyan-500/5 blur-sm"
                                         initial={config.initial}
-                                        animate={{
-                                            x: "0%", y: "0%", rotate: (Math.random() - 0.5) * 20,
-                                            scale: 0,
-                                            opacity: 0,
-                                        }}
-                                        transition={{
-                                            ...config.transition,
-                                            ease: "circOut",
-                                            duration: 2,
-                                        }}
+                                        animate={{ x: "0%", y: "0%", rotate: (Math.random() - 0.5) * 20, scale: 0, opacity: 0 }}
+                                        transition={{ ...config.transition, ease: "circOut", duration: 2 }}
                                     />
                                 ))}
-                                {/* @ts-ignore */}
                                 <motion.div
                                     initial={{ opacity: 0, scale: 0.8 }}
                                     animate={{ opacity: 1, scale: 1 }}
@@ -540,19 +865,13 @@ function App() {
                                     className="flex flex-col items-center"
                                 >
                                     <label htmlFor="file-upload" className="cursor-pointer group transform hover:scale-105 transition-transform duration-300">
-                                        <PolaroidCard 
-                                            caption="Click to begin"
-                                            status="done"
-                                        />
+                                        <PolaroidCard caption="Click to begin" status="done" />
                                     </label>
                                     <input id="file-upload" type="file" className="hidden" accept="image/png, image/jpeg, image/webp" onChange={handleImageUpload} />
                                     <p className="mt-8 font-permanent-marker text-neutral-400 text-center max-w-xs text-base sm:text-lg">
                                         Click the polaroid to upload your photo and start your journey through time.
                                     </p>
-                                    <button
-                                        onClick={() => setIsCameraOpen(true)}
-                                        className={`${secondaryButtonClasses} mt-6`}
-                                    >
+                                    <button onClick={() => setIsCameraOpen(true)} className={`${secondaryButtonClasses} mt-6`}>
                                         Or use your camera
                                     </button>
                                 </motion.div>
@@ -560,18 +879,13 @@ function App() {
                         )}
 
                         {appState === 'image-uploaded' && uploadedImage && (
-                            // @ts-ignore
                             <motion.div 
                                 className="flex flex-col items-center gap-6"
                                 initial={{ opacity: 0, y: 20 }}
                                 animate={{ opacity: 1, y: 0 }}
                                 transition={{ duration: 0.5 }}
                             >
-                                <PolaroidCard 
-                                    imageUrl={uploadedImage} 
-                                    caption="Your Photo" 
-                                    status="done"
-                                />
+                                <PolaroidCard imageUrl={uploadedImage} caption="Your Photo" status="done" />
                                 <div className="w-full max-w-2xl text-center mt-4">
                                     <h3 className="font-permanent-marker text-2xl text-neutral-100 mb-4">Choose Your Decades</h3>
                                     <div className="flex flex-wrap justify-center gap-3">
@@ -621,6 +935,13 @@ function App() {
                                                 onShake={handleRegenerateDecade}
                                                 onDownload={handleDownloadIndividualImage}
                                                 onShare={handleShareIndividualImage}
+                                                onAnimate={handleAnimateDecade}
+                                                onEdit={handleOpenEditModal}
+                                                onPlayAudio={handlePlayAudio}
+                                                onViewVideo={(d) => setVideoModal({ decade: d, url: generatedImages[d]?.videoUrl! })}
+                                                isAnimating={generatedImages[decade]?.videoStatus === 'pending'}
+                                                isAudioLoading={generatedImages[decade]?.audioStatus === 'pending'}
+                                                videoUrl={generatedImages[decade]?.videoUrl}
                                                 isMobile={isMobile}
                                                 progress={progressPercentage}
                                             />
@@ -630,21 +951,15 @@ function App() {
                                     <div ref={dragAreaRef} className="relative w-full max-w-5xl h-[50vh] sm:h-[600px] mt-4">
                                         {generatedDecades.map((decade, generatedIndex) => {
                                             const originalIndex = DECADES.indexOf(decade);
-                                            if (originalIndex === -1) return null; // Safety check
+                                            if (originalIndex === -1) return null;
                                             const { top, left, rotate } = POSITIONS[originalIndex];
                                             return (
-                                                // @ts-ignore
                                                 <motion.div
                                                     key={decade}
                                                     className="absolute cursor-grab active:cursor-grabbing"
                                                     style={{ top, left }}
                                                     initial={{ opacity: 0, scale: 0.5, y: 100, rotate: 0 }}
-                                                    animate={{ 
-                                                        opacity: 1, 
-                                                        scale: 1, 
-                                                        y: 0,
-                                                        rotate: `${rotate}deg`,
-                                                    }}
+                                                    animate={{ opacity: 1, scale: 1, y: 0, rotate: `${rotate}deg` }}
                                                     transition={{ type: 'spring', stiffness: 100, damping: 20, delay: generatedIndex * 0.15 }}
                                                 >
                                                     <PolaroidCard 
@@ -657,6 +972,13 @@ function App() {
                                                         onShake={handleRegenerateDecade}
                                                         onDownload={handleDownloadIndividualImage}
                                                         onShare={handleShareIndividualImage}
+                                                        onAnimate={handleAnimateDecade}
+                                                        onEdit={handleOpenEditModal}
+                                                        onPlayAudio={handlePlayAudio}
+                                                        onViewVideo={(d) => setVideoModal({ decade: d, url: generatedImages[d]?.videoUrl! })}
+                                                        isAnimating={generatedImages[decade]?.videoStatus === 'pending'}
+                                                        isAudioLoading={generatedImages[decade]?.audioStatus === 'pending'}
+                                                        videoUrl={generatedImages[decade]?.videoUrl}
                                                         isMobile={isMobile}
                                                         progress={progressPercentage}
                                                     />
@@ -668,7 +990,6 @@ function App() {
                                 <div className="h-20 mt-4 flex items-center justify-center">
                                     <AnimatePresence mode="wait">
                                         {appState === 'generating' && (
-                                            // @ts-ignore
                                             <motion.div 
                                                 key="progress"
                                                 className="w-full max-w-md text-center"
@@ -683,7 +1004,6 @@ function App() {
                                                         : 'Warming up the time machine...'}
                                                 </p>
                                                 <div className="w-full bg-neutral-800 rounded-full h-2.5">
-                                                    {/* @ts-ignore */}
                                                     <motion.div 
                                                         className="bg-cyan-400 h-2.5 rounded-full"
                                                         animate={{ width: `${progressPercentage}%` }}
@@ -693,7 +1013,6 @@ function App() {
                                             </motion.div>
                                         )}
                                         {appState === 'results-shown' && (
-                                            // @ts-ignore
                                             <motion.div
                                                 key="results-buttons" 
                                                 initial={{ opacity: 0 }}
@@ -702,19 +1021,11 @@ function App() {
                                                 transition={{ duration: 0.3 }}
                                                 className="flex flex-col sm:flex-row items-center gap-4"
                                             >
-                                                <button 
-                                                    onClick={handleDownloadAlbum} 
-                                                    disabled={isDownloading} 
-                                                    className={`${primaryButtonClasses} disabled:opacity-50 disabled:cursor-not-allowed`}
-                                                >
+                                                <button onClick={handleDownloadAlbum} disabled={isDownloading} className={`${primaryButtonClasses} disabled:opacity-50 disabled:cursor-not-allowed`}>
                                                     {isDownloading ? 'Creating Album...' : 'Download Album'}
                                                 </button>
                                                 {isShareSupported && (
-                                                     <button 
-                                                        onClick={handleShareAlbum} 
-                                                        disabled={isSharing} 
-                                                        className={`${secondaryButtonClasses} disabled:opacity-50 disabled:cursor-not-allowed`}
-                                                    >
+                                                     <button onClick={handleShareAlbum} disabled={isSharing} className={`${secondaryButtonClasses} disabled:opacity-50 disabled:cursor-not-allowed`}>
                                                         {isSharing ? 'Sharing...' : 'Share Album'}
                                                     </button>
                                                 )}
@@ -745,6 +1056,44 @@ function App() {
                     onClose={() => setIsProfileOpen(false)}
                     onSignOut={handleSignOut}
                 />
+            )}
+             {authStatus === 'authenticated' && isHistoryOpen && (
+                <HistoryPanel
+                    sessions={sessions}
+                    onLoadSession={loadSession}
+                    onClose={() => setIsHistoryOpen(false)}
+                />
+            )}
+            {videoModal && (
+                <VideoPlayerModal 
+                    decade={videoModal.decade}
+                    videoUrl={videoModal.url}
+                    onClose={() => setVideoModal(null)}
+                />
+            )}
+            {decadeToAnimate && (
+                <VideoOptionsModal
+                    decade={decadeToAnimate}
+                    onClose={() => setDecadeToAnimate(null)}
+                    onStartAnimation={handleStartAnimation}
+                />
+            )}
+            {editingImage && (
+                <ImageEditModal
+                    editingImage={editingImage}
+                    onClose={() => setEditingImage(null)}
+                    onApplyEdit={handleApplyImageEdit}
+                />
+            )}
+            {isApiKeyPromptOpen && (
+                 <ApiKeyPrompt
+                    onClose={() => setIsApiKeyPromptOpen(false)}
+                    onSelectKey={async () => {
+                        setIsApiKeyPromptOpen(false);
+                        await window.aistudio.openSelectKey();
+                        // User needs to click the animate button again after this.
+                    }}
+                 />
             )}
         </main>
     );
